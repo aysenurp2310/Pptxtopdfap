@@ -39,10 +39,10 @@ import gdown
 import requests
 from lxml import etree
 from PIL import Image as PILImage
-from PIL import ImageOps
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
+from pptx.util import Pt
 from pypdf import PdfReader, PdfWriter
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
@@ -74,12 +74,18 @@ SOFFICE_TIMEOUT_SEC = 600       # Büyük dosyalar için dönüştürme zaman a�
 # sonra tek PDF'te birleştiriyoruz. Bu, tek bir dev dosyanın LibreOffice'in
 # bellek/CPU sınırlarını (özellikle Railway gibi kısıtlı sunucularda)
 # zorlamasını ve zaman aşımına takılmasını önlemeye yardımcı olur.
-CHUNK_SLIDE_THRESHOLD = 40      # bu slayt sayısından fazlaysa böl
-CHUNK_FILE_SIZE_MB_THRESHOLD = 30  # bu boyuttan büyükse de böl (ağır medya)
+CHUNK_SLIDE_THRESHOLD = 100     # bu slayt sayısından fazlaysa böl (yalnızca aşırı durumlar için; asıl tetikleyici dosya boyutu)
+CHUNK_FILE_SIZE_MB_THRESHOLD = 30  # bu boyuttan büyükse de böl (ağır medya) — parçalamanın asıl sebebi bu
 CHUNK_SIZE = 15                 # her parçada kaç slayt olacak
 
-# Akış hâlinde görsel sıkıştırmadan sonra bile bu boyutu aşan sunumları
-# daha küçük slayt gruplarıyla dönüştürerek bellek yükünü sınırlıyoruz.
+# python-pptx ile bir dosyayı açmak (font tarama, autofit düzeltmesi,
+# parçalama) dosyanın TAMAMINI belleğe yükler. Ama artık bu kontrol
+# GÖRSEL SIKIŞTIRMADAN SONRAKİ boyuta bakıyor — ve görsel sıkıştırmanın
+# kendisi (çok daha ağır bir python-pptx işlemi, görselleri gerçekten
+# decode/encode ediyor) 484MB'lık dosyalarda bile başarıyla çalıştığı
+# doğrulandı. Bu yüzden font/autofit gibi çok daha hafif işlemler için
+# eşiği yüksek tutuyoruz; aksi hâlde büyük dosyalarda metin taşması/
+# görsel kayması sorunları geri dönüyordu.
 MEMORY_SAFE_PPTX_MB_THRESHOLD = 400
 
 # Otomatik görsel sıkıştırma: dosya bu boyutu aşarsa, PowerPoint'in
@@ -120,13 +126,13 @@ logger = logging.getLogger("pptx2pdf_bot")
 # --------------------------------------------------------------------------- #
 # Amaç: Sadece bilinen tek bir fontu değil, ileride gelecek herhangi bir
 # sunumdaki eksik fontu da mümkün olduğunca otomatik çözmek. Akış:
-#   1) Dosyada kullanılan tüm font isimleri (slaytlar + düzenler + asıl
-#      slaytlar + tema + madde imleri) çıkarılır.
+#   1) Dosyada kullanılan tüm font isimleri (tema + çalıştırma/run seviyesi
+#      + tablo hücreleri) çıkarılır.
 #   2) Sistemde zaten kurulu olanlar atlanır.
-#   3) Lisanslı bir Office fontuysa (FONT_ALIASES) ölçülmüş özgür karşılığı
-#      kurulur ve fontconfig'e "bunun yerine onu ver" eşleştirmesi yazılır.
+#   3) Bilinen bir açık kaynak karşılığı varsa (FONT_ALIASES) o zaten
+#      build sırasında kurulu olduğu için ekstra işlem gerekmez.
 #   4) Kalanlar için Google Fonts'un herkese açık CSS API'si üzerinden
-#      aynı isimde bir font aranır ve varsa dört stiliyle indirilip kurulur.
+#      aynı isimde bir font aranır ve varsa indirilip sisteme kurulur.
 #      Bu, GitHub deposundaki dosya adlandırma biçimini (bazı fontlar artık
 #      "variable font" tek dosya olarak dağıtıldığı için) tahmin etmeye
 #      çalışmaktan çok daha güvenilirdir.
@@ -135,111 +141,83 @@ logger = logging.getLogger("pptx2pdf_bot")
 # bu durumda kesin bir garanti verilemez.
 
 FONT_ALIASES = {
-    # Microsoft/Office'e ait, lisanslı olduğu için sunucuya kurulamayan ve
-    # Google Fonts'ta da bulunmayan fontlar -> yerine kullanılacak özgür font.
-    #
-    # Karşılıklar GÖRÜNÜŞE göre değil ÖLÇÜME göre seçildi: gerçek fontun ve
-    # adayların harf genişlikleri (Türkçe + İngilizce örnek metin üzerinde)
-    # karşılaştırıldı. Satırın nereden kırılacağını harf genişliği belirler;
-    # genişliği tutmayan bir ikame metni taşırır/kaydırır. Yanlarındaki
-    # yüzdeler ortalama genişlik farkıdır (Calibri -> Carlito ölçümü %0,0
-    # çıkarak yöntemi doğruladı; eski "Tw Cen MT -> Poppins" ise +%22 idi).
-    #
-    # Eşleştirme fontconfig'e _write_fontconfig_aliases() ile yazılır; hedef
-    # font kurulu değilse Google Fonts'tan indirilir.
-    "aptos": "Barlow",                              # -0,6
-    "aptos light": "Barlow",
-    "aptos semibold": "Barlow",
-    "aptos extrabold": "Barlow",
-    "aptos black": "Barlow",
-    "aptos display": "Sofia Sans Semi Condensed",   # +0,6
-    "aptos narrow": "Sofia Sans Semi Condensed",    # -1,0
-    "calibri": "Carlito",                           #  0,0 (birebir)
-    "calibri light": "Carlito",                     # +1,2
+    # Yaygın Microsoft fontları için, Google Fonts'ta bulunmayan ama
+    # açık kaynaklı karşılığı build sırasında zaten kurulmuş olanlar.
+    # (Karşılıklar Dockerfile'da fontconfig ile eşleştirilir.)
+    "tw cen mt": "Poppins",
+    "calibri": "Carlito",
     "cambria": "Caladea",
-    "cambria math": "Caladea",
-    "tw cen mt": "Carlito",                         # +1,2
-    "tw cen mt condensed": "Yanone Kaffeesatz",     # +1,8
-    "century gothic": "Inter",                      # +0,1
-    "gill sans mt": "Carlito",                      # -1,2
-    "gill sans": "Carlito",
-    "franklin gothic book": "Gudea",                #  0,0
-    "franklin gothic medium": "Quattrocento Sans",  # +0,2
-    "garamond": "Crimson Text",                     # +0,1
-    "bahnschrift": "Fira Sans",                     # +0,5
-    "segoe ui": "Asap",                             #  0,0
-    "segoe ui light": "Asap",
-    "segoe ui semibold": "Asap",
-    "tahoma": "Figtree",                            # +0,1
-    "candara": "Source Sans 3",                     # -0,7
-    "corbel": "Assistant",                          # -0,2
-    "constantia": "Vollkorn",                       # +0,7
-    "consolas": "Anonymous Pro",                    # -0,7
-    "rockwell": "Bitter",                           # +0,4
-    "bookman old style": "Domine",                  # -2,7
-    "book antiqua": "Gelasio",                      # -0,5
-    "palatino linotype": "Gelasio",                 # -0,5
-    "century schoolbook": "Libre Caslon Text",      # +1,4
-    "arial narrow": "Archivo Narrow",               # +0,4
 }
 
 DYNAMIC_FONT_DIR = "/usr/share/fonts/truetype/dynamic"
-_GOOGLE_FONTS_CSS_URL = "https://fonts.googleapis.com/css2"
-# Normal + kalın + italik + kalın italik birlikte istenir. Yalnızca normal
-# kalınlık indirilirse LibreOffice kalın/italik metni YAPAY olarak üretir;
-# yapay kalının genişlikleri gerçeğinden farklıdır ve satırlar başka yerden
-# kırılır. Bir ailede istenen stil yoksa Google 400 döner, o yüzden sırayla
-# daha az stil isteyen sorgulara düşülür.
-_GOOGLE_FONTS_STYLE_LADDER = (
-    ":ital,wght@0,400;0,700;1,400;1,700",
-    ":wght@400;700",
-    "",
-)
-# DİKKAT: buraya tarayıcı taklidi yapan bir User-Agent KOYMA. Eski bir
-# tarayıcı kimliğiyle sorulduğunda Google artık .ttf değil EOT döndürüyor
-# (fontconfig okuyamaz); kimliksiz sorguda dört stil de TrueType gelir.
-_FONT_FILE_MAGICS = (b"\x00\x01\x00\x00", b"OTTO", b"true")
-_FONTCONFIG_ALIAS_FILENAME = "35-pptx2pdf-aliases.conf"
+_GOOGLE_FONTS_CSS_URL = "https://fonts.googleapis.com/css2?family={family}"
+# Eski bir tarayıcı User-Agent'ı göndermek, Google'ın woff2 yerine
+# doğrudan .ttf font dosyası linki döndürmesini sağlar (LibreOffice/
+# fontconfig woff2'yi güvenilir şekilde desteklemez).
+_OLD_BROWSER_UA = "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)"
 
 _dynamic_font_attempted = set()   # bu süreç ömrü boyunca denenen fontlar
 _dynamic_font_lock = threading.Lock()
 
 
-_FONT_TAG_PATTERN = re.compile(
-    rb"<(?:\w+:)?(?:latin|ea|cs|sym|buFont)\b[^>]*?\btypeface=\"([^\"]+)\""
-)
-_FONT_XML_PARTS = re.compile(
-    r"ppt/(?:slides|slideLayouts|slideMasters|theme|notesMasters)/[^/]+\.xml$"
-)
+def _iter_text_frames(shapes):
+    """
+    Bir slayttaki tüm metin çerçevelerini dolaşır: normal metin kutuları,
+    gruplanmış şekillerin içindekiler (iç içe olsa bile) ve tablo
+    hücrelerindeki metinler dahil.
+    """
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from _iter_text_frames(shape.shapes)
+        elif getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    yield cell.text_frame
+        elif getattr(shape, "has_text_frame", False):
+            yield shape.text_frame
+
+
+def _extract_theme_fonts(pptx_path: str) -> set:
+    """Pptx içindeki tema dosyalarından (theme1.xml, theme2.xml, ...)
+    ana/gövde font isimlerini çıkarır."""
+    fonts = set()
+    ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+    try:
+        with zipfile.ZipFile(pptx_path) as z:
+            theme_files = [
+                n for n in z.namelist()
+                if re.match(r"ppt/theme/theme\d+\.xml$", n)
+            ]
+            for tf in theme_files:
+                root = etree.fromstring(z.read(tf))
+                for tag in ("majorFont", "minorFont"):
+                    el = root.find(f".//a:fontScheme/a:{tag}/a:latin", ns)
+                    if el is not None:
+                        typeface = el.get("typeface")
+                        if typeface and not typeface.startswith("+"):
+                            fonts.add(typeface)
+    except Exception:  # noqa: BLE001
+        logger.exception("Tema fontları okunurken hata oluştu")
+    return fonts
 
 
 def extract_fonts_used(pptx_path: str) -> set:
-    """
-    Bir pptx dosyasında kullanılan tüm font isimlerini döner.
-
-    Dosya python-pptx ile AÇILMAZ (o, dosyanın tamamını belleğe alır);
-    yalnızca slayt / düzen / asıl slayt / tema XML'leri zip'ten okunup
-    taranır. Eskiden yalnızca slaytlardaki metin parçalarına bakılıyordu;
-    oysa başlık ve gövde metinlerinin fontu çoğu zaman slaytta değil ASIL
-    SLAYTTA (slideMaster) ve düzenlerde tanımlıdır, madde imlerinin fontu
-    (buFont) da ayrıdır — bunlar gözden kaçıyordu.
-
-    Temadaki dile özel uzun liste (<a:font script="Jpan" .../> vb.)
-    bilerek alınmaz: onlarca Uzak Doğu fontunu tek tek aramaya yol açar.
-    """
+    """Bir pptx dosyasında (tema dahil) kullanılan tüm font isimlerini döner."""
     fonts = set()
     try:
-        with zipfile.ZipFile(pptx_path) as z:
-            for name in z.namelist():
-                if not _FONT_XML_PARTS.match(name):
-                    continue
-                for raw in _FONT_TAG_PATTERN.findall(z.read(name)):
-                    typeface = raw.decode("utf-8", "replace").strip()
-                    if typeface and not typeface.startswith("+"):
-                        fonts.add(typeface)
+        prs = Presentation(pptx_path)
+        for slide in prs.slides:
+            for text_frame in _iter_text_frames(slide.shapes):
+                for paragraph in text_frame.paragraphs:
+                    for run in paragraph.runs:
+                        name = run.font.name
+                        if name and not name.startswith("+"):
+                            fonts.add(name)
     except Exception:  # noqa: BLE001
         logger.exception("Font taraması sırasında hata oluştu")
-    return fonts
+
+    fonts |= _extract_theme_fonts(pptx_path)
+    return {f.strip() for f in fonts if f and f.strip()}
 
 
 def _get_installed_font_families() -> set:
@@ -264,117 +242,47 @@ def _get_installed_font_families() -> set:
 
 def _download_google_font(family_name: str) -> bool:
     """
-    Google Fonts'un herkese açık CSS API'sinden verilen isimde bir fontu
-    arar ve bulduğu bütün stilleri (normal / kalın / italik / kalın italik)
-    indirir. En az bir stil indirildiyse True döner.
+    Google Fonts'un herkese açık CSS API'sinden verilen isimde bir font
+    aramayı ve indirmeyi dener. Bulunup indirilirse True döner.
     """
-    family_name = family_name.strip()
     try:
-        css_text = None
-        for style_query in _GOOGLE_FONTS_STYLE_LADDER:
-            css_resp = requests.get(
-                _GOOGLE_FONTS_CSS_URL,
-                params={"family": family_name + style_query},
-                timeout=8,
-            )
-            if css_resp.status_code == 200 and "@font-face" in css_resp.text:
-                css_text = css_resp.text
-                break
-        if css_text is None:
+        family_param = requests.utils.quote(family_name.strip())
+        url = _GOOGLE_FONTS_CSS_URL.format(family=family_param)
+        css_resp = requests.get(
+            url, headers={"User-Agent": _OLD_BROWSER_UA}, timeout=8
+        )
+        if css_resp.status_code != 200:
+            return False
+
+        match = re.search(
+            r"url\((https://fonts\.gstatic\.com/[^)]+?\.ttf)\)", css_resp.text
+        )
+        if not match:
+            return False
+
+        font_resp = requests.get(match.group(1), timeout=15)
+        if font_resp.status_code != 200 or len(font_resp.content) < 1000:
             return False
 
         os.makedirs(DYNAMIC_FONT_DIR, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9]", "", family_name)
-        saved = 0
-
-        for block in re.findall(r"@font-face\s*{[^}]*}", css_text):
-            url_match = re.search(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", block)
-            if not url_match:
-                continue
-            weight_match = re.search(r"font-weight:\s*(\d+)", block)
-            weight = weight_match.group(1) if weight_match else "400"
-            italic = "Italic" if re.search(r"font-style:\s*italic", block) else ""
-
-            font_resp = requests.get(url_match.group(1), timeout=20)
-            data = font_resp.content
-            if (
-                font_resp.status_code != 200
-                or len(data) < 1000
-                or data[:4] not in _FONT_FILE_MAGICS
-            ):
-                # TrueType/OpenType değilse (EOT, woff2...) fontconfig
-                # okuyamaz; kurulmuş gibi görünüp işe yaramayacağına atla.
-                logger.warning(
-                    "'%s' için beklenmeyen font biçimi, atlandı (%r)",
-                    family_name, data[:4],
-                )
-                continue
-
-            out_path = os.path.join(
-                DYNAMIC_FONT_DIR, f"{safe_name}-{weight}{italic}.ttf"
-            )
-            with open(out_path, "wb") as fh:
-                fh.write(data)
-            saved += 1
-
-        return saved > 0
+        out_path = os.path.join(DYNAMIC_FONT_DIR, f"{safe_name}-Regular.ttf")
+        with open(out_path, "wb") as fh:
+            fh.write(font_resp.content)
+        return True
 
     except Exception:  # noqa: BLE001
         logger.exception("Google Fonts'tan '%s' indirilirken hata oluştu", family_name)
         return False
 
 
-def _write_fontconfig_aliases() -> None:
-    """
-    FONT_ALIASES tablosunu fontconfig'e yazar ("X fontu istenirse Y'yi ver").
-    Bu dosya olmadan tablo hiçbir işe yaramaz: LibreOffice bulamadığı font
-    için kendi varsayılanına (çok daha geniş bir fonta) düşer.
-
-    binding="same", fontconfig'in kendi ölçü-uyumlu eşleştirmelerinde
-    (30-metric-aliases.conf) kullandığı bağlamadır; LibreOffice bunu "aynı
-    font" sayıp başka bir ikame aramaz. İçerik değişmediyse dosyaya
-    dokunulmaz.
-    """
-    lines = [
-        '<?xml version="1.0"?>',
-        '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">',
-        "<fontconfig>",
-    ]
-    for source, target in sorted(FONT_ALIASES.items()):
-        lines.append(
-            f'  <alias binding="same"><family>{source}</family>'
-            f"<accept><family>{target}</family></accept></alias>"
-        )
-    lines.append("</fontconfig>")
-    content = "\n".join(lines) + "\n"
-
-    user_conf_dir = os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-        "fontconfig", "conf.d",
-    )
-    for conf_dir in ("/etc/fonts/conf.d", user_conf_dir):
-        path = os.path.join(conf_dir, _FONTCONFIG_ALIAS_FILENAME)
-        try:
-            if os.path.exists(path):
-                with open(path, encoding="utf-8") as fh:
-                    if fh.read() == content:
-                        return
-            os.makedirs(conf_dir, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            return
-        except OSError:
-            continue  # sistem dizinine yazılamıyorsa kullanıcı dizinini dene
-    logger.warning("Fontconfig eşleştirme dosyası yazılamadı")
-
-
 def ensure_fonts_available(pptx_path: str) -> None:
     """
     Dosyada kullanılan fontlardan sistemde kurulu olmayanları tespit eder
-    ve mümkünse otomatik olarak temin eder: aynı isimle Google Fonts'ta
-    varsa onu, yoksa FONT_ALIASES'taki ölçülmüş karşılığını indirir.
-    Hiçbiri yoksa LibreOffice'in varsayılan ikamesi kullanılır — bu
-    fonksiyon en iyi çabayı gösterir, %100 garanti vermez.
+    ve mümkünse otomatik olarak temin eder (bilinen ikame veya Google
+    Fonts'tan canlı indirme). Bulunamayan fontlar için LibreOffice'in
+    varsayılan ikamesi kullanılmaya devam eder — bu fonksiyon en iyi
+    çabayı gösterir, %100 garanti vermez.
     """
     used_fonts = extract_fonts_used(pptx_path)
     if not used_fonts:
@@ -384,33 +292,23 @@ def ensure_fonts_available(pptx_path: str) -> None:
     downloaded_any = False
 
     with _dynamic_font_lock:
-        _write_fontconfig_aliases()
-
         for font_name in used_fonts:
             key = font_name.lower()
+
             if key in installed:
                 continue
-
-            # Lisanslı Office fontu: adıyla aramak boşuna, karşılığını kur.
-            wanted = FONT_ALIASES.get(key, font_name)
-            wanted_key = wanted.lower()
-            if wanted_key in installed or wanted_key in _dynamic_font_attempted:
+            if key in FONT_ALIASES:
+                # Build sırasında zaten kurulu bilinen bir ikamesi var
+                # (Dockerfile'daki fontconfig eşleştirmesi devreye girer).
+                continue
+            if key in _dynamic_font_attempted:
                 continue
 
-            _dynamic_font_attempted.add(wanted_key)  # tekrar denemeyi engelle
+            _dynamic_font_attempted.add(key)  # tekrar denemeyi engelle
 
-            if _download_google_font(wanted):
-                installed.add(wanted_key)
+            if _download_google_font(font_name):
+                logger.info("Font otomatik indirildi: %s", font_name)
                 downloaded_any = True
-                if wanted == font_name:
-                    logger.info("Font otomatik indirildi: %s", font_name)
-                else:
-                    logger.info("Font karşılığı indirildi: %s -> %s", font_name, wanted)
-            else:
-                logger.warning(
-                    "Font bulunamadı, LibreOffice varsayılanı kullanılacak: %s",
-                    font_name,
-                )
 
     if downloaded_any:
         try:
@@ -442,10 +340,6 @@ def convert_pptx_to_pdf(input_path: str, output_dir: str) -> str:
     LibreOffice'i headless modda çalıştırarak pptx -> pdf dönüştürür.
     Yüksek kaliteli görsel/metin çıktısı için PDF export filtre
     seçenekleri ayarlanır (JPEG sıkıştırması kapalı, çözünürlük yüksek).
-
-    Metin boyutlarına ve normAutofit ayarlarına dokunulmaz. LibreOffice
-    fontScale / lnSpcReduction ile şablondan gelen puntoyu birlikte
-    uygular; bu bilgileri silmek metni büyütüp görsellerin altına taşırır.
     """
     soffice = find_soffice()
 
@@ -492,189 +386,34 @@ def convert_pptx_to_pdf(input_path: str, output_dir: str) -> str:
         env=env,
     )
 
-    if result.returncode != 0:
-        logger.error("soffice stderr: %s", result.stderr)
-        logger.error("soffice stdout: %s", result.stdout)
-        raise RuntimeError(f"LibreOffice dönüştürme hatası:\n{result.stderr or result.stdout}")
-
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     pdf_path = os.path.join(output_dir, base_name + ".pdf")
 
-    if not os.path.exists(pdf_path):
-        raise RuntimeError("PDF dosyası oluşturulamadı (beklenmeyen çıktı yolu).")
+    # ÖNEMLİ: LibreOffice bazen PDF'i başarıyla oluşturduğu hâlde
+    # sıfır olmayan bir çıkış koduyla (returncode != 0) kapanabiliyor
+    # — bilinen, zararsız bir tuhaflık. Bu yüzden önce çıkış koduna
+    # değil, dosyanın GERÇEKTEN oluşup oluşmadığına bakıyoruz; dosya
+    # varsa ve boş değilse, çıkış kodu ne olursa olsun başarılı sayarız.
+    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+        if result.returncode != 0:
+            logger.warning(
+                "soffice sıfır olmayan kodla (%s) çıktı ama PDF yine de "
+                "oluşmuş, başarılı sayılıyor. stderr: %s",
+                result.returncode, result.stderr,
+            )
+        return pdf_path
 
-    return pdf_path
+    logger.error("soffice stderr: %s", result.stderr)
+    logger.error("soffice stdout: %s", result.stdout)
+    raise RuntimeError(
+        f"LibreOffice dönüştürme hatası (çıkış kodu {result.returncode}):\n"
+        f"{result.stderr or result.stdout}"
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Büyük dosyalar için: parçalama, ayrı ayrı dönüştürme, birleştirme
 # --------------------------------------------------------------------------- #
-
-_SHRINK_IMAGE_EXTS = (
-    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp",
-)
-# PDF statik bir format: gömülü video/ses hiçbir şekilde PDF'e girmez, ama
-# büyük sunumların boyutunun çoğu genelde bunlardır. Parçayı paketten
-# SİLMEK ilişkileri (rels) bozar; bunun yerine içeriğini boşaltıyoruz —
-# slayttaki kapak görseli (poster frame) ayrı bir görsel olduğu için
-# PDF'te aynen görünmeye devam eder.
-_SHRINK_MEDIA_EXTS = (
-    ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".mpg", ".mpeg", ".mkv", ".webm",
-    ".mp3", ".wav", ".m4a", ".wma", ".aac", ".ogg",
-)
-_SHRINK_MIN_IMAGE_BYTES = 150 * 1024  # bundan küçük görselle uğraşmaya değmez
-
-
-def _recompress_image_blob(blob: bytes, max_dimension: int, jpeg_quality: int):
-    """
-    Tek bir görselin baytlarını küçültüp yeniden sıkıştırır. Daha küçük bir
-    sonuç elde edilemezse (veya görsel açılamazsa) None döner.
-
-    Saydamlığı olan görseller (logo, kesilmiş figür vb.) JPEG'e çevrilirse
-    arka planları SİYAH olur; bunlar PNG olarak kalır, sadece küçültülür.
-    """
-    try:
-        pil_img = PILImage.open(io.BytesIO(blob))
-        orig_format = pil_img.format
-        orig_w, orig_h = pil_img.size
-    except Exception:  # noqa: BLE001
-        return None
-
-    if orig_format not in ("JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP"):
-        return None
-
-    # JPEG "draft" modu: 40-50MP'lik bir fotoğrafı tam çözünürlükte decode
-    # etmeden, baştan küçük boyutta açar — tepe belleği ciddi düşürür.
-    if orig_format == "JPEG" and max(orig_w, orig_h) > max_dimension:
-        try:
-            pil_img.draft("RGB", (max_dimension, max_dimension))
-        except Exception:  # noqa: BLE001
-            pass
-
-    try:
-        pil_img.load()
-        # LibreOffice JPEG'i EXIF yönüne göre döndürerek açar; yeniden
-        # kaydederken EXIF kaybolduğu için dönüşü piksellere işliyoruz ki
-        # görsel PDF'te yan yatmasın.
-        pil_img = ImageOps.exif_transpose(pil_img)
-    except Exception:  # noqa: BLE001
-        return None
-
-    has_alpha = pil_img.mode in ("RGBA", "LA") or (
-        pil_img.mode == "P" and "transparency" in pil_img.info
-    )
-
-    w, h = pil_img.size
-    if max(w, h) > max_dimension:
-        scale = max_dimension / max(w, h)
-        if has_alpha and pil_img.mode != "RGBA":
-            pil_img = pil_img.convert("RGBA")
-        elif not has_alpha and pil_img.mode not in ("RGB", "L"):
-            pil_img = pil_img.convert("RGB")
-        pil_img = pil_img.resize(
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            PILImage.LANCZOS,
-        )
-
-    buf = io.BytesIO()
-    try:
-        if has_alpha:
-            pil_img.save(buf, format="PNG", optimize=True)
-        else:
-            if pil_img.mode not in ("RGB", "L"):
-                pil_img = pil_img.convert("RGB")
-            pil_img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-    except Exception:  # noqa: BLE001
-        return None
-
-    new_blob = buf.getvalue()
-    return new_blob if len(new_blob) < len(blob) else None
-
-
-def shrink_pptx_streaming(
-    input_path: str,
-    output_path: str,
-    max_dimension: int = IMAGE_MAX_DIMENSION_PX,
-    jpeg_quality: int = IMAGE_JPEG_QUALITY,
-    progress_callback=None,
-) -> tuple:
-    """
-    Büyük bir pptx'i, python-pptx ile AÇMADAN (yani dosyanın tamamını
-    belleğe almadan) küçültür. pptx bir zip'tir: girdiler tek tek okunur,
-    ppt/media altındaki görseller birer birer yeniden sıkıştırılır,
-    video/ses içerikleri boşaltılır, geri kalan her şey olduğu gibi akış
-    hâlinde kopyalanır. Tepe bellek ≈ o an işlenen TEK görsel; dosyanın
-    500MB olması belleği etkilemez.
-
-    Görselin biçimi değişse de (PNG -> JPEG) zip içindeki adı aynı kalır;
-    LibreOffice görsel türünü uzantıdan değil içerikten tanır
-    (compress_pptx_images de aynı varsayıma dayanıyor).
-
-    Dönüş: (sıkıştırılan_görsel_sayısı, boşaltılan_medya_sayısı).
-    """
-    compressed_count = 0
-    blanked_count = 0
-
-    with zipfile.ZipFile(input_path) as zin:
-        infos = zin.infolist()
-        media_total = sum(
-            1 for i in infos if i.filename.lower().startswith("ppt/media/")
-        )
-        media_done = 0
-
-        with zipfile.ZipFile(output_path, "w", allowZip64=True) as zout:
-            for info in infos:
-                name_lower = info.filename.lower()
-                ext = os.path.splitext(name_lower)[1]
-                is_media = name_lower.startswith("ppt/media/")
-
-                if is_media and ext in _SHRINK_MEDIA_EXTS:
-                    zout.writestr(info.filename, b"", zipfile.ZIP_STORED)
-                    blanked_count += 1
-                elif (
-                    is_media
-                    and ext in _SHRINK_IMAGE_EXTS
-                    and info.file_size >= _SHRINK_MIN_IMAGE_BYTES
-                ):
-                    blob = zin.read(info)
-                    new_blob = _recompress_image_blob(
-                        blob, max_dimension, jpeg_quality
-                    )
-                    if new_blob is not None:
-                        compressed_count += 1
-                        blob = new_blob
-                    # Görseller zaten sıkıştırılmış veri; tekrar deflate
-                    # etmek sadece CPU harcar.
-                    zout.writestr(info.filename, blob, zipfile.ZIP_STORED)
-                    del blob, new_blob
-                    gc.collect()
-                else:
-                    compress_type = (
-                        zipfile.ZIP_STORED if is_media else zipfile.ZIP_DEFLATED
-                    )
-                    out_info = zipfile.ZipInfo(info.filename, info.date_time)
-                    out_info.compress_type = compress_type
-                    with zin.open(info) as src, zout.open(out_info, "w") as dst:
-                        shutil.copyfileobj(src, dst, 1024 * 1024)
-
-                if is_media:
-                    media_done += 1
-                    if progress_callback is not None and (
-                        media_done % 10 == 0 or media_done == media_total
-                    ):
-                        progress_callback(media_done, media_total)
-
-    return compressed_count, blanked_count
-
-
-def count_slides_fast(pptx_path: str) -> int:
-    """Slayt sayısını, dosyanın tamamını belleğe yüklemeden (yalnızca
-    ppt/presentation.xml'i okuyarak) döndürür."""
-    with zipfile.ZipFile(pptx_path) as z:
-        root = etree.fromstring(z.read("ppt/presentation.xml"))
-    sld_id_lst = root.find(qn("p:sldIdLst"))
-    return 0 if sld_id_lst is None else len(sld_id_lst)
-
 
 def _keep_only_slides(prs: Presentation, keep_indices: set) -> None:
     """
@@ -702,21 +441,36 @@ def _keep_only_slides(prs: Presentation, keep_indices: set) -> None:
                     pass
 
 
-def write_pptx_chunk(
-    input_path: str, chunk_path: str, start: int, end: int
-) -> None:
+def split_pptx_into_chunks(input_path: str, work_dir: str, chunk_size: int) -> list:
     """
-    input_path'teki sunumun [start, end) aralığındaki slaytlarını ayrı bir
-    pptx olarak chunk_path'e yazar.
+    Bir pptx dosyasını, her biri en fazla chunk_size slayt içeren ayrı
+    pptx dosyalarına böler. Bölmeye gerek yoksa (slayt sayısı zaten
+    küçükse) tek elemanlı [input_path] listesi döner.
+    """
+    prs_full = Presentation(input_path)
+    total = len(prs_full.slides)
 
-    Parçalar TEK TEK üretilir (hepsi baştan değil): aynı anda bellekte
-    yalnızca bir Presentation, diskte yalnızca bir parça bulunur.
-    """
-    prs_chunk = Presentation(input_path)
-    _keep_only_slides(prs_chunk, set(range(start, end)))
-    prs_chunk.save(chunk_path)
-    del prs_chunk
-    gc.collect()
+    if total <= chunk_size:
+        return [input_path]
+
+    chunk_paths = []
+    num_chunks = math.ceil(total / chunk_size)
+
+    for c in range(num_chunks):
+        start = c * chunk_size
+        end = min(start + chunk_size, total)
+        keep = set(range(start, end))
+
+        # Her parça için orijinal dosyanın taze bir kopyasını aç, böylece
+        # önceki parçalarda yapılan silmeler birbirini etkilemez.
+        prs_chunk = Presentation(input_path)
+        _keep_only_slides(prs_chunk, keep)
+
+        chunk_path = os.path.join(work_dir, f"chunk_{c:03d}.pptx")
+        prs_chunk.save(chunk_path)
+        chunk_paths.append(chunk_path)
+
+    return chunk_paths
 
 
 def split_pdf_by_size(
@@ -773,85 +527,152 @@ def convert_pptx_to_pdf_chunked(
     work_dir: str,
     chunk_size: int = CHUNK_SIZE,
     progress_callback=None,
-    already_shrunk: bool = False,
-) -> str:
+) -> tuple:
     """
     Büyük/ağır bir sunumu slayt gruplarına böler, her grubu ayrı ayrı
     PDF'e çevirir ve sonunda hepsini tek bir PDF'te birleştirir.
 
-    Her parça sırayla üretilir -> dönüştürülür -> ara dosyaları silinir;
-    diskte hiçbir an tek parçadan fazlası (ve biriken küçük PDF'ler
-    dışında bir şey) durmaz.
-
     progress_callback(done, total) verilirse her parça tamamlandığında
     çağrılır (ilerleme durumu göstermek için).
 
-    already_shrunk=True ise görseller shrink_pptx_streaming ile zaten
-    küçültülmüştür; parça başına ikinci bir sıkıştırma yapılmaz.
-    """
-    total = count_slides_fast(input_path)
+    Bir parça hiçbir şekilde dönüştürülemezse (LibreOffice'in
+    anlamlandıramadığı bir içerik varsa), o parça atlanır ve işleme
+    devam edilir — tek bir sorunlu parça yüzünden tüm işlem durmaz.
 
-    if total <= chunk_size:
-        # Bölmeye gerek yok, normal (bölünmemiş) yoldan devam et.
-        return convert_pptx_to_pdf(input_path, work_dir)
+    Dönüş: (pdf_yolu, atlanan_parça_numaraları) ikilisi.
+    """
+    chunk_paths = split_pptx_into_chunks(input_path, work_dir, chunk_size)
+
+    if len(chunk_paths) == 1:
+        # Bölmeye gerek yoktu, normal (bölünmemiş) yoldan devam et.
+        return convert_pptx_to_pdf(chunk_paths[0], work_dir), []
 
     pdf_chunk_paths = []
-    total_chunks = math.ceil(total / chunk_size)
+    failed_chunk_numbers = []
+    total_chunks = len(chunk_paths)
 
-    for i in range(total_chunks):
+    for i, chunk_path in enumerate(chunk_paths):
         chunk_out_dir = os.path.join(work_dir, f"chunk_out_{i:03d}")
         os.makedirs(chunk_out_dir, exist_ok=True)
 
-        chunk_path = os.path.join(chunk_out_dir, f"chunk_{i:03d}.pptx")
-        write_pptx_chunk(
-            input_path, chunk_path, i * chunk_size, min((i + 1) * chunk_size, total)
-        )
-
         # Her parçayı LibreOffice'e vermeden önce, SADECE O PARÇAYI
-        # (tüm dosyayı değil) sıkıştır. Bu, bellek yükünü çok düşük
-        # tutar — aynı anda hafızada sadece birkaç slaytlık görsel
-        # bulunur, devasa dosyanın tamamı değil.
+        # (tüm dosyayı değil) sıkıştır + font tara + autofit düzelt.
+        # Bu, bellek yükünü çok düşük tutar — aynı anda hafızada sadece
+        # birkaç slaytlık veri bulunur, devasa dosyanın tamamı değil.
         convert_source = chunk_path
-        if not already_shrunk:
+
+        # 1) Font tarama / otomatik indirme.
+        try:
+            ensure_fonts_available(convert_source)
+        except Exception:  # noqa: BLE001
+            logger.exception("Parça %d font taraması başarısız", i)
+
+        # 2) Autofit (otomatik küçültme) düzeltmesi.
+        try:
+            fixed_chunk_path = os.path.join(chunk_out_dir, "fixed.pptx")
+            was_fixed = fix_autofit_shrink(convert_source, fixed_chunk_path)
+            if was_fixed and os.path.exists(fixed_chunk_path):
+                convert_source = fixed_chunk_path
+        except Exception:  # noqa: BLE001
+            logger.exception("Parça %d autofit düzeltmesi başarısız", i)
+
+        # 3) Görsel sıkıştırma.
+        try:
+            compressed_chunk_path = os.path.join(chunk_out_dir, "compressed.pptx")
+            count, _saved = compress_pptx_images(
+                convert_source,
+                compressed_chunk_path,
+                max_dimension=IMAGE_MAX_DIMENSION_PX,
+                jpeg_quality=IMAGE_JPEG_QUALITY,
+            )
+            if count > 0 and os.path.exists(compressed_chunk_path):
+                convert_source = compressed_chunk_path
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
+            )
+
+        # Dönüştürmeyi dene: önce hazırlanmış (sıkıştırılmış/düzeltilmiş)
+        # sürümle, o başarısız olursa ORİJİNAL (işlenmemiş) parçayla bir
+        # kez daha dene — nadiren bizim ön işleme adımlarımız (autofit/
+        # sıkıştırma) LibreOffice'in anlamlandıramadığı bir dosya
+        # üretebilir; bu durumda ham hâliyle deneriz.
+        pdf_path = None
+        last_error = None
+        candidates = [convert_source]
+        if chunk_path not in candidates:
+            candidates.append(chunk_path)
+
+        for candidate in candidates:
             try:
-                compressed_chunk_path = os.path.join(chunk_out_dir, "compressed.pptx")
-                count, _saved = compress_pptx_images(
-                    chunk_path,
-                    compressed_chunk_path,
-                    max_dimension=IMAGE_MAX_DIMENSION_PX,
-                    jpeg_quality=IMAGE_JPEG_QUALITY,
-                )
-                if count > 0 and os.path.exists(compressed_chunk_path):
-                    convert_source = compressed_chunk_path
-            except Exception:  # noqa: BLE001
+                pdf_path = convert_pptx_to_pdf(candidate, chunk_out_dir)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
                 logger.exception(
-                    "Parça %d sıkıştırması başarısız, orijinal parça kullanılacak", i
+                    "Parça %d dönüştürme denemesi başarısız (%s)", i, candidate
                 )
 
-        pdf_path = convert_pptx_to_pdf(convert_source, chunk_out_dir)
-
-        # Parçanın PDF'i dışındaki her şeyi (parça pptx'leri, LibreOffice
-        # profili) hemen sil; disk kullanımı parça sayısıyla büyümesin.
-        for entry in os.listdir(chunk_out_dir):
-            entry_path = os.path.join(chunk_out_dir, entry)
-            if entry_path == pdf_path:
-                continue
-            if os.path.isdir(entry_path):
-                shutil.rmtree(entry_path, ignore_errors=True)
-            else:
-                try:
-                    os.remove(entry_path)
-                except OSError:
-                    pass
-
-        pdf_chunk_paths.append(pdf_path)
+        if pdf_path is not None:
+            pdf_chunk_paths.append(pdf_path)
+        else:
+            # Bu parça hiçbir şekilde dönüştürülemedi — tamamen durmak
+            # yerine atlayıp devam ediyoruz, sonunda hangi slaytların
+            # eksik kaldığını kullanıcıya bildireceğiz.
+            failed_chunk_numbers.append(i + 1)
+            logger.error("Parça %d tamamen başarısız, atlanıyor: %s", i, last_error)
 
         if progress_callback is not None:
             progress_callback(i + 1, total_chunks)
 
+    if not pdf_chunk_paths:
+        raise RuntimeError(
+            "Hiçbir parça dönüştürülemedi. Dosyada LibreOffice'in "
+            "işleyemediği bir içerik olabilir."
+        )
+
     merged_path = os.path.join(work_dir, "merged.pdf")
     merge_pdfs(pdf_chunk_paths, merged_path)
-    return merged_path
+    return merged_path, failed_chunk_numbers
+
+
+def _get_autofit_scale(text_frame):
+    """
+    PowerPoint'in bir metin kutusuna uyguladığı "otomatik küçült"
+    (shrink text on overflow) oranını pptx XML'inden okur.
+    Örn. fontScale="92500" -> 0.925 (yani %92.5'e küçültülmüş) döner.
+    Küçültme uygulanmamışsa None döner.
+    """
+    txBody = text_frame._txBody
+    bodyPr = txBody.find(qn("a:bodyPr"))
+    if bodyPr is None:
+        return None
+    norm_autofit = bodyPr.find(qn("a:normAutofit"))
+    if norm_autofit is None:
+        return None
+    font_scale_attr = norm_autofit.get("fontScale")
+    if not font_scale_attr:
+        return None
+    scale = int(font_scale_attr) / 100000.0
+    if scale >= 0.999:
+        return None
+    return scale
+
+
+def _disable_autofit(text_frame):
+    """
+    normAutofit etiketini kaldırıp yerine noAutofit ekler; böylece
+    biz gerçek (küçültülmüş) font boyutunu yazdıktan sonra LibreOffice
+    üzerine bir daha küçültme uygulamaya çalışmaz.
+    """
+    bodyPr = text_frame._txBody.find(qn("a:bodyPr"))
+    if bodyPr is None:
+        return
+    norm_autofit = bodyPr.find(qn("a:normAutofit"))
+    if norm_autofit is not None:
+        bodyPr.remove(norm_autofit)
+    if bodyPr.find(qn("a:noAutofit")) is None:
+        etree.SubElement(bodyPr, qn("a:noAutofit"))
 
 
 def _iter_all_shapes(shapes):
@@ -975,6 +796,57 @@ def compress_pptx_images(
     return compressed_count, saved_bytes
 
 
+def fix_autofit_shrink(input_path: str, output_path: str) -> bool:
+    """
+    PowerPoint'in "metni otomatik küçült" özelliğiyle küçülttüğü ama
+    LibreOffice'in PDF'e çevirirken doğru uygulamadığı font boyutlarını,
+    gerçek (küçültülmüş) punto değeri olarak dosyaya yazar.
+
+    Böylece LibreOffice, PowerPoint'te ekranda görünenle aynı boyutta
+    metin render eder ve metnin görsellerin/diğer öğelerin üzerine
+    taşması engellenir.
+
+    Yalnızca OOXML tabanlı formatlar (.pptx, .pptm, .potx) desteklenir;
+    eski ikili .ppt formatı python-pptx tarafından okunamadığından
+    bu durumda dosya olduğu gibi bırakılır (False döner).
+
+    Dönüş: en az bir düzeltme yapıldıysa True, hiçbir şey
+    değiştirilmediyse (veya dosya işlenemediyse) False.
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext not in (".pptx", ".pptm", ".potx"):
+        return False
+
+    try:
+        prs = Presentation(input_path)
+    except Exception:
+        logger.exception("Autofit düzeltmesi için dosya açılamadı, atlanıyor")
+        return False
+
+    changed = False
+
+    for slide in prs.slides:
+        for text_frame in _iter_text_frames(slide.shapes):
+            scale = _get_autofit_scale(text_frame)
+            if scale is None:
+                continue
+
+            for paragraph in text_frame.paragraphs:
+                if paragraph.font.size is not None:
+                    paragraph.font.size = Pt(paragraph.font.size.pt * scale)
+                for run in paragraph.runs:
+                    if run.font.size is not None:
+                        run.font.size = Pt(run.font.size.pt * scale)
+
+            _disable_autofit(text_frame)
+            changed = True
+
+    if changed:
+        prs.save(output_path)
+
+    return changed
+
+
 # --------------------------------------------------------------------------- #
 # Telegram Handler'ları
 # --------------------------------------------------------------------------- #
@@ -1043,59 +915,6 @@ async def convert_and_reply(
         is_pptx_like = ext in (".pptx", ".pptm", ".potx")
 
         raw_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        already_shrunk = False
-
-        # 0) Büyük dosya: python-pptx'e DOKUNMADAN önce zip seviyesinde
-        #    küçült. python-pptx bir dosyayı açarken TAMAMINI belleğe alır;
-        #    500MB'lık bir sunumu (hele her parça için yeniden) açmak
-        #    sunucunun belleğini taşırıyordu. Akış hâlindeki bu ön adım
-        #    aynı anda yalnızca tek bir görseli bellekte tutar ve sonraki
-        #    bütün adımlar küçülmüş dosya üzerinde çalışır.
-        if is_pptx_like and raw_size_mb > IMAGE_COMPRESS_THRESHOLD_MB:
-            await status_msg.edit_text(
-                f"🗜️ Dosya {raw_size_mb:.0f} MB, görseller tek tek "
-                "küçültülüyor... (birkaç dakika sürebilir)"
-            )
-            passes = (
-                (IMAGE_MAX_DIMENSION_PX, IMAGE_JPEG_QUALITY),
-                (IMAGE_MAX_DIMENSION_PX_AGGRESSIVE, IMAGE_JPEG_QUALITY_AGGRESSIVE),
-            )
-            for pass_no, (max_dim, quality) in enumerate(passes, start=1):
-                shrunk_path = os.path.join(work_dir, f"shrunk{pass_no}_{file_name}")
-                try:
-                    img_count, media_count = await loop.run_in_executor(
-                        None,
-                        shrink_pptx_streaming,
-                        input_path,
-                        shrunk_path,
-                        max_dim,
-                        quality,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "Akış hâlinde küçültme başarısız, mevcut dosyayla devam"
-                    )
-                    try:
-                        os.remove(shrunk_path)
-                    except OSError:
-                        pass
-                    break
-
-                new_size_mb = os.path.getsize(shrunk_path) / (1024 * 1024)
-                logger.info(
-                    "Küçültme turu %d: %d görsel, %d video/ses, %.0fMB -> %.0fMB",
-                    pass_no, img_count, media_count, raw_size_mb, new_size_mb,
-                )
-                # Eski (büyük) dosyayı hemen sil; disk de sınırlı.
-                try:
-                    os.remove(input_path)
-                except OSError:
-                    pass
-                input_path = shrunk_path
-                raw_size_mb = new_size_mb
-                already_shrunk = True
-                if new_size_mb <= IMAGE_SECOND_PASS_THRESHOLD_MB:
-                    break
 
         # Parçalama gerekip gerekmeyeceğine ERKEN karar veriyoruz (tüm
         # dosyayı sıkıştırmadan/font taramadan ÖNCE). Çünkü büyük
@@ -1106,19 +925,9 @@ async def convert_and_reply(
         slide_count = 0
         if is_pptx_like:
             try:
-                slide_count = count_slides_fast(input_path)
+                slide_count = len(Presentation(input_path).slides)
             except Exception:  # noqa: BLE001
                 logger.exception("Slayt sayısı okunamadı")
-
-        # Fontlar: parçalansın ya da parçalanmasın, dosyanın TAMAMI için bir
-        # kez hazırlanır. Tarama yalnızca zip içindeki XML'leri okur, büyük
-        # dosyada da ucuzdur. Eksik font = farklı harf genişliği = metnin
-        # ve çevresindeki görsellerin kayması.
-        if is_pptx_like:
-            try:
-                await loop.run_in_executor(None, ensure_fonts_available, input_path)
-            except Exception:  # noqa: BLE001
-                logger.exception("Font hazırlığı sırasında hata oluştu, devam ediliyor")
 
         will_chunk = is_pptx_like and (
             slide_count > CHUNK_SLIDE_THRESHOLD
@@ -1128,15 +937,19 @@ async def convert_and_reply(
         convert_input_path = input_path
 
         if will_chunk:
-            # Büyük dosya: kalan görsel sıkıştırma işlemi her parça
-            # üzerinde ayrı ayrı (çok daha az bellekle) uygulanacak.
+            # Büyük dosya: tüm-dosya sıkıştırma/font/autofit adımlarını
+            # atla — bunlar convert_pptx_to_pdf_chunked içinde HER PARÇA
+            # için ayrı ayrı (çok daha az bellekle) uygulanacak.
             await status_msg.edit_text(
                 f"🔄 Büyük dosya tespit edildi ({slide_count} slayt, "
                 f"{raw_size_mb:.0f} MB).\nParçalara bölünüp, her parça "
                 "ayrı ayrı sıkıştırılıp dönüştürülecek..."
             )
         else:
-            # Küçük/orta boy dosya: gerekiyorsa görselleri sıkıştır.
+            # Küçük/orta boy dosya: tüm dosya üzerinde sıkıştırma +
+            # font taraması + autofit düzeltmesi güvenle uygulanabilir.
+
+            # 1) Görselleri sıkıştır (dosya yeterince büyükse).
             if raw_size_mb > IMAGE_COMPRESS_THRESHOLD_MB and is_pptx_like:
                 await status_msg.edit_text(
                     f"🗜️ Dosya {raw_size_mb:.0f}MB, görseller sıkıştırılıyor..."
@@ -1179,6 +992,26 @@ async def convert_and_reply(
                         "Görsel sıkıştırma başarısız, orijinal dosyayla devam ediliyor"
                     )
 
+            # 2) Font tarama.
+            if is_pptx_like:
+                try:
+                    await loop.run_in_executor(
+                        None, ensure_fonts_available, convert_input_path
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Font hazırlığı sırasında hata oluştu, devam ediliyor")
+
+            # 3) Autofit düzeltmesi.
+            fixed_path = os.path.join(work_dir, "fixed_" + file_name)
+            try:
+                was_fixed = await loop.run_in_executor(
+                    None, fix_autofit_shrink, convert_input_path, fixed_path
+                )
+                if was_fixed:
+                    convert_input_path = fixed_path
+            except Exception:  # noqa: BLE001
+                logger.exception("Autofit düzeltmesi başarısız, orijinal dosya kullanılacak")
+
         # Çok büyük dosyalarda LibreOffice'in her seferinde işlediği yükü
         # daha da azaltmak için daha küçük parçalar kullan.
         effective_chunk_size = (
@@ -1186,16 +1019,17 @@ async def convert_and_reply(
         )
         use_chunking = will_chunk
 
+        failed_chunk_numbers = []
+
         if use_chunking:
             progress_cb = _make_progress_callback(loop, status_msg)
-            pdf_path = await loop.run_in_executor(
+            pdf_path, failed_chunk_numbers = await loop.run_in_executor(
                 None,
                 convert_pptx_to_pdf_chunked,
                 convert_input_path,
                 work_dir,
                 effective_chunk_size,
                 progress_cb,
-                already_shrunk,
             )
         else:
             await status_msg.edit_text("🔄 PDF'e dönüştürülüyor... (biraz sürebilir)")
@@ -1216,12 +1050,22 @@ async def convert_and_reply(
 
         pdf_filename = os.path.splitext(file_name)[0] + ".pdf"
 
+        if failed_chunk_numbers:
+            skipped_note = (
+                f"\n\n⚠️ {len(failed_chunk_numbers)} parça (parça no: "
+                f"{', '.join(str(n) for n in failed_chunk_numbers)}) "
+                "LibreOffice tarafından işlenemediği için atlandı, "
+                "PDF'de o slaytlar eksik olabilir."
+            )
+        else:
+            skipped_note = ""
+
         if len(pdf_parts) == 1:
             with open(pdf_parts[0], "rb") as pdf_file:
                 await update.message.reply_document(
                     document=pdf_file,
                     filename=pdf_filename,
-                    caption="✅ Dönüştürme tamamlandı.",
+                    caption=f"✅ Dönüştürme tamamlandı.{skipped_note}",
                 )
         else:
             base_name = os.path.splitext(pdf_filename)[0]
@@ -1238,7 +1082,7 @@ async def convert_and_reply(
                         filename=part_filename,
                         caption=(
                             f"✅ Bölüm {idx}/{total_parts} "
-                            "(dosya 50MB sınırını aştığı için parçalandı)"
+                            f"(dosya 50MB sınırını aştığı için parçalandı){skipped_note}"
                         ),
                     )
 
@@ -1602,3 +1446,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
